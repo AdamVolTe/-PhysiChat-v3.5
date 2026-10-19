@@ -1,0 +1,10 @@
+torch
+numpy
+scipy
+matplotlib
+pandas
+plotly
+streamlit
+anthropic
+sympy
+duckduckgo_search
