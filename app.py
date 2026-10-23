@@ -379,6 +379,7 @@ def get_user_status(visitor_id: str):
         return {"count": 0, "is_pro": False, "reset_at": None}
     except Exception as exc:
         print(f"Supabase error: {exc}")
+        st.session_state["db_error"] = str(exc)[:300]
         return {"count": 0, "is_pro": False, "reset_at": None}
 
 def bump_count(visitor_id: str, new_count: int, new_window: bool):
@@ -400,6 +401,7 @@ def bump_count(visitor_id: str, new_count: int, new_window: bool):
                                                      "last_date": now.isoformat(), "is_pro": False}).execute()
     except Exception as exc:
         print(f"Supabase error: {exc}")
+        st.session_state["db_error"] = str(exc)[:300]
 
 # The visitor id lives in the URL (?vid=...), so a refresh keeps the same account
 # (and the same Pro status). Use the sidebar box to restore a code on another device.
@@ -603,21 +605,21 @@ def page_pricing():
 
     with col2:
         st.subheader("🥉 شهري")
-        st.markdown("**درهم 49/ شهر**")
+        st.markdown("**49 درهم / شهر**")
         st.write("• رسائل غير محدودة ♾️")
         st.write("• محاكاة بصرية كاملة")
         st.button("اختر الشهري", key="m_btn")
 
     with col3:
         st.subheader("🥈 6 أشهر")
-        st.markdown("**درهم 125/ 6 أشهر**")
+        st.markdown("**125 درهم / 6 أشهر**")
         st.write("• توفير مهم للفصل الدراسي")
         st.write("• محاكاة بصرية كاملة")
         st.button("اختر 6 أشهر", key="s_btn")
 
     with col4:
         st.subheader("👑 سنوي")
-        st.markdown("**درهم 200/ سنة**")
+        st.markdown("**200 درهم / سنة**")
         st.write("• توفير كبير جداً ⭐")
         st.write("• دعم ومميزات حصرية")
         st.button("اختر السنوي", key="y_btn")
@@ -670,6 +672,10 @@ with st.sidebar:
         # جلب العداد المحدث من قاعدة البيانات مباشرة للعرض
         current_status = get_user_status(current_visitor_id)
         st.warning(f"📊 الرسائل اليومية: {current_status['count']}/{FREE_DAILY_LIMIT}")
+        if supabase is None:
+            st.caption("⚠️ Supabase غير متصل: تأكد من SUPABASE_URL و SUPABASE_KEY فـ .env")
+        elif st.session_state.get("db_error"):
+            st.caption(f"⚠️ Supabase error: {st.session_state['db_error']}")
         
     st.caption("AI Engine: Groq Llama 3 (Active)")
     if st.button("🗑 Clear chat"):
