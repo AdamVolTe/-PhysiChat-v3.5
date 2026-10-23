@@ -603,21 +603,21 @@ def page_pricing():
 
     with col2:
         st.subheader("🥉 شهري")
-        st.markdown("**49 درهم / شهر**")
+        st.markdown("**درهم 49/ شهر**")
         st.write("• رسائل غير محدودة ♾️")
         st.write("• محاكاة بصرية كاملة")
         st.button("اختر الشهري", key="m_btn")
 
     with col3:
         st.subheader("🥈 6 أشهر")
-        st.markdown("**125 درهم / 6 أشهر**")
+        st.markdown("**درهم 125/ 6 أشهر**")
         st.write("• توفير مهم للفصل الدراسي")
         st.write("• محاكاة بصرية كاملة")
         st.button("اختر 6 أشهر", key="s_btn")
 
     with col4:
         st.subheader("👑 سنوي")
-        st.markdown("**200 درهم / سنة**")
+        st.markdown("**درهم 200/ سنة**")
         st.write("• توفير كبير جداً ⭐")
         st.write("• دعم ومميزات حصرية")
         st.button("اختر السنوي", key="y_btn")
