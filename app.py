@@ -1,6 +1,6 @@
 import io
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import matplotlib
 matplotlib.use("Agg")
@@ -26,7 +26,8 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-FREE_DAILY_LIMIT = 10
+FREE_DAILY_LIMIT = 5                 # free messages per rolling window
+FREE_WINDOW = timedelta(hours=24)    # window starts at the first message
 # Training is heavy: only enabled when you run locally with ALLOW_TRAINING=1 in .env
 ALLOW_TRAINING = os.getenv("ALLOW_TRAINING", "0") == "1"
 
@@ -330,44 +331,73 @@ def render_result(res, key):
 # =====================================================================
 # Database Helpers & Pro Logic
 # =====================================================================
-def _today():
-    return datetime.now().strftime("%Y-%m-%d")
+def _now():
+    return datetime.now(timezone.utc)
+
+def _parse_ts(value):
+    """Parses the window start stored in last_date (ISO timestamp, or an old 'YYYY-MM-DD')."""
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+def fmt_remaining(reset_at):
+    if not reset_at:
+        return "24 ساعة"
+    secs = max(0, int((reset_at - _now()).total_seconds()))
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f"{h} ساعة و {m} دقيقة"
 
 def get_user_status(visitor_id: str):
-    """Returns {"count", "is_pro"}. The daily counter resets when last_date != today."""
-    today = _today()
+    """
+    Returns {"count", "is_pro", "reset_at"}.
+    Rolling 24h window: it starts at the first message and the counter resets
+    once 24 hours have passed (window start is stored in the last_date column).
+    """
+    now = _now()
     if supabase is None:   # no database configured: per-session counter, nobody is Pro
-        local = st.session_state.setdefault("local_usage", {"date": today, "count": 0})
-        if local["date"] != today:
-            local.update(date=today, count=0)
-        return {"count": local["count"], "is_pro": False}
+        local = st.session_state.setdefault("local_usage", {"start": None, "count": 0})
+        if local["start"] and now - local["start"] >= FREE_WINDOW:
+            local.update(start=None, count=0)
+        reset_at = local["start"] + FREE_WINDOW if (local["start"] and local["count"]) else None
+        return {"count": local["count"], "is_pro": False, "reset_at": reset_at}
     try:
         res = supabase.table("visitor_limits").select("*").eq("visitor_id", visitor_id).execute()
         if res.data:
             row = res.data[0]
             count = row.get("message_count", 0) or 0
-            if str(row.get("last_date") or "")[:10] != today:     # new day -> reset
+            start = _parse_ts(row.get("last_date"))
+            if count > 0 and (start is None or now - start >= FREE_WINDOW):   # window over -> reset
                 count = 0
                 supabase.table("visitor_limits").update(
-                    {"message_count": 0, "last_date": today}).eq("visitor_id", visitor_id).execute()
-            return {"count": count, "is_pro": bool(row.get("is_pro", False))}
+                    {"message_count": 0}).eq("visitor_id", visitor_id).execute()
+            reset_at = start + FREE_WINDOW if (count > 0 and start) else None
+            return {"count": count, "is_pro": bool(row.get("is_pro", False)), "reset_at": reset_at}
         supabase.table("visitor_limits").insert(
-            {"visitor_id": visitor_id, "message_count": 0, "last_date": today, "is_pro": False}).execute()
-        return {"count": 0, "is_pro": False}
+            {"visitor_id": visitor_id, "message_count": 0, "last_date": now.isoformat(), "is_pro": False}).execute()
+        return {"count": 0, "is_pro": False, "reset_at": None}
     except Exception as exc:
         print(f"Supabase error: {exc}")
-        return {"count": 0, "is_pro": False}
+        return {"count": 0, "is_pro": False, "reset_at": None}
 
-def bump_count(visitor_id: str, new_count: int, today: str):
+def bump_count(visitor_id: str, new_count: int, new_window: bool):
+    """new_window=True when this is the first message of a window (stores the start time)."""
+    now = _now()
     if supabase is None:
-        st.session_state.setdefault("local_usage", {"date": today, "count": 0})["count"] = new_count
+        local = st.session_state.setdefault("local_usage", {"start": None, "count": 0})
+        local["count"] = new_count
+        if new_window:
+            local["start"] = now
         return
     try:
-        res = supabase.table("visitor_limits").update(
-            {"message_count": new_count, "last_date": today}).eq("visitor_id", visitor_id).execute()
+        payload = {"message_count": new_count}
+        if new_window:
+            payload["last_date"] = now.isoformat()
+        res = supabase.table("visitor_limits").update(payload).eq("visitor_id", visitor_id).execute()
         if not res.data:
             supabase.table("visitor_limits").insert({"visitor_id": visitor_id, "message_count": new_count,
-                                                     "last_date": today, "is_pro": False}).execute()
+                                                     "last_date": now.isoformat(), "is_pro": False}).execute()
     except Exception as exc:
         print(f"Supabase error: {exc}")
 
@@ -389,6 +419,7 @@ current_visitor_id = st.session_state.visitor_id
 user_status = get_user_status(current_visitor_id)
 is_pro_user = user_status["is_pro"]
 msg_count = user_status["count"]
+reset_at = user_status.get("reset_at")
 
 # =====================================================================
 # Pages (General AI + Physics)
@@ -425,10 +456,9 @@ def page_chat():
         prompt = chat_input_prompt
 
     if prompt:
-        today_str = datetime.now().strftime("%Y-%m-%d")
         
         if not is_pro_user and msg_count >= FREE_DAILY_LIMIT:
-            st.error("🛑 وصلتي للحد الأقصى اليومي (10 رسائل مجانية).")
+            st.error(f"🛑 وصلتي للحد الأقصى ({FREE_DAILY_LIMIT} رسائل مجانية). تتجدد بعد {fmt_remaining(reset_at)}.")
             st.info("💡 اشترك في باقة Pro لتستمتع برسائل ومحاكاة غير محدودة!")
             
             whatsapp_number = "212717817730"
@@ -438,7 +468,7 @@ def page_chat():
         else:
             if not is_pro_user:
                 new_count = msg_count + 1
-                bump_count(current_visitor_id, new_count, today_str)
+                bump_count(current_visitor_id, new_count, new_window=(msg_count == 0))
             
             st.session_state.messages.append({"role": "user", "content": prompt, "results": []})
             with st.chat_message("user"):
@@ -566,9 +596,9 @@ def page_pricing():
 
     with col1:
         st.subheader("🆓 المجانية")
-        st.write("• 10 رسائل مجانية يومياً")
+        st.write(f"• {FREE_DAILY_LIMIT} رسائل مجانية كل 24 ساعة")
         st.write("• إجابات ذكية وسريعة")
-        st.write("• تتجدد تلقائياً كل 24 ساعة")
+        st.write("• تتجدد بعد 24 ساعة من أول رسالة")
         st.button("الحالية", disabled=True, key="free_btn")
 
     with col2:
