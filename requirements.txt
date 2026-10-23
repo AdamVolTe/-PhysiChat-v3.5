@@ -7,6 +7,6 @@ plotly
 streamlit
 groq
 sympy
-duckduckgo_search
+ddgs
 python-dotenv
 supabase

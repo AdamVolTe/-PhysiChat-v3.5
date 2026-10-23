@@ -1,7 +1,9 @@
-"""
-Live Web Search module using DuckDuckGo (Free & No API Key needed).
-"""
-from duckduckgo_search import DDGS
+"""Live web search using DuckDuckGo (free, no API key)."""
+try:
+    from ddgs import DDGS                      # new package name
+except ImportError:                            # pragma: no cover
+    from duckduckgo_search import DDGS         # old package name
+
 
 def search_web(query: str, max_results: int = 3) -> str:
     """Performs a live web search and returns formatted text with context and links."""
@@ -10,7 +12,6 @@ def search_web(query: str, max_results: int = 3) -> str:
             results = list(ddgs.text(query, max_results=max_results))
         if not results:
             return "لم يتم العثور على نتائج مباشرة في الويب."
-        
         output = []
         for r in results:
             title = r.get("title", "بدون عنوان")

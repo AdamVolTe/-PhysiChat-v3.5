@@ -10,13 +10,14 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import torch
+import re
 import uuid
 
 from matplotlib.backends.backend_pdf import PdfPages
 
 from analysis import energy, summarize, velocity
 from chat_agent import chat_turn, get_api_key
-from physics_engine import ALPHA_MAX, DOMAINS, PhysicsEngineCore, reference_solution
+from physics_engine import ALPHA_MAX, DOMAINS, T_MAX, PhysicsEngineCore, reference_solution
 from physics_trainer import MODELS_DIR, train_domain
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -25,10 +26,20 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+FREE_DAILY_LIMIT = 10
+# Training is heavy: only enabled when you run locally with ALLOW_TRAINING=1 in .env
+ALLOW_TRAINING = os.getenv("ALLOW_TRAINING", "0") == "1"
 
 @st.cache_resource
-def init_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+def init_supabase():
+    """Returns a Supabase client, or None if it is not configured / unreachable."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        print(f"Supabase init error: {exc}")
+        return None
 
 supabase = init_supabase()
 
@@ -155,7 +166,10 @@ def simulate(system, alpha, horizon, version):
     }
 
 def run_simulation(system, alpha, horizon):
-    return simulate(system, round(float(alpha), 2), round(float(horizon), 1), st.session_state.model_version)
+    """Clamps inputs to the range the PINNs were trained on (outside it results are unreliable)."""
+    alpha = min(max(float(alpha), 0.0), float(ALPHA_MAX))
+    horizon = min(max(float(horizon), 5.0), float(T_MAX))
+    return simulate(system, round(alpha, 2), round(horizon, 1), st.session_state.model_version)
 
 @st.cache_data(show_spinner=False)
 def error_grid(domain, version):
@@ -316,29 +330,61 @@ def render_result(res, key):
 # =====================================================================
 # Database Helpers & Pro Logic
 # =====================================================================
+def _today():
+    return datetime.now().strftime("%Y-%m-%d")
+
 def get_user_status(visitor_id: str):
-    """جلب حالة المستخدم وحالة Pro من قاعدة بيانات Supabase"""
+    """Returns {"count", "is_pro"}. The daily counter resets when last_date != today."""
+    today = _today()
+    if supabase is None:   # no database configured: per-session counter, nobody is Pro
+        local = st.session_state.setdefault("local_usage", {"date": today, "count": 0})
+        if local["date"] != today:
+            local.update(date=today, count=0)
+        return {"count": local["count"], "is_pro": False}
     try:
         res = supabase.table("visitor_limits").select("*").eq("visitor_id", visitor_id).execute()
-        if res.data and len(res.data) > 0:
-            user_data = res.data[0]
-            return {
-                "count": user_data.get("message_count", 0),
-                "is_pro": user_data.get("is_pro", False)
-            }
-        else:
-            supabase.table("visitor_limits").insert({
-                "visitor_id": visitor_id, 
-                "message_count": 0, 
-                "is_pro": False
-            }).execute()
-            return {"count": 0, "is_pro": False}
-    except Exception:
+        if res.data:
+            row = res.data[0]
+            count = row.get("message_count", 0) or 0
+            if str(row.get("last_date") or "")[:10] != today:     # new day -> reset
+                count = 0
+                supabase.table("visitor_limits").update(
+                    {"message_count": 0, "last_date": today}).eq("visitor_id", visitor_id).execute()
+            return {"count": count, "is_pro": bool(row.get("is_pro", False))}
+        supabase.table("visitor_limits").insert(
+            {"visitor_id": visitor_id, "message_count": 0, "last_date": today, "is_pro": False}).execute()
+        return {"count": 0, "is_pro": False}
+    except Exception as exc:
+        print(f"Supabase error: {exc}")
         return {"count": 0, "is_pro": False}
 
-if "visitor_id" not in st.session_state:
-    st.session_state.visitor_id = str(uuid.uuid4())[:8].upper()
+def bump_count(visitor_id: str, new_count: int, today: str):
+    if supabase is None:
+        st.session_state.setdefault("local_usage", {"date": today, "count": 0})["count"] = new_count
+        return
+    try:
+        res = supabase.table("visitor_limits").update(
+            {"message_count": new_count, "last_date": today}).eq("visitor_id", visitor_id).execute()
+        if not res.data:
+            supabase.table("visitor_limits").insert({"visitor_id": visitor_id, "message_count": new_count,
+                                                     "last_date": today, "is_pro": False}).execute()
+    except Exception as exc:
+        print(f"Supabase error: {exc}")
 
+# The visitor id lives in the URL (?vid=...), so a refresh keeps the same account
+# (and the same Pro status). Use the sidebar box to restore a code on another device.
+VID_RE = re.compile(r"[A-Z0-9]{8,12}")
+
+def _init_visitor_id():
+    if "visitor_id" in st.session_state:
+        return
+    vid = str(st.query_params.get("vid", "")).upper()
+    if not VID_RE.fullmatch(vid):
+        vid = uuid.uuid4().hex[:10].upper()
+        st.query_params["vid"] = vid
+    st.session_state.visitor_id = vid
+
+_init_visitor_id()
 current_visitor_id = st.session_state.visitor_id
 user_status = get_user_status(current_visitor_id)
 is_pro_user = user_status["is_pro"]
@@ -381,7 +427,7 @@ def page_chat():
     if prompt:
         today_str = datetime.now().strftime("%Y-%m-%d")
         
-        if not is_pro_user and msg_count >= 10:
+        if not is_pro_user and msg_count >= FREE_DAILY_LIMIT:
             st.error("🛑 وصلتي للحد الأقصى اليومي (10 رسائل مجانية).")
             st.info("💡 اشترك في باقة Pro لتستمتع برسائل ومحاكاة غير محدودة!")
             
@@ -392,21 +438,7 @@ def page_chat():
         else:
             if not is_pro_user:
                 new_count = msg_count + 1
-                try:
-                    res_update = supabase.table("visitor_limits").update({
-                        "message_count": new_count,
-                        "last_date": today_str
-                    }).eq("visitor_id", current_visitor_id).execute()
-                    
-                    if not res_update.data:
-                        supabase.table("visitor_limits").insert({
-                            "visitor_id": current_visitor_id,
-                            "message_count": new_count,
-                            "last_date": today_str,
-                            "is_pro": False
-                        }).execute()
-                except Exception as e:
-                    print(f"Supabase error: {e}")
+                bump_count(current_visitor_id, new_count, today_str)
             
             st.session_state.messages.append({"role": "user", "content": prompt, "results": []})
             with st.chat_message("user"):
@@ -493,7 +525,9 @@ def page_lab():
     epochs = c2.slider("Epochs", 1000, 10000, 6000, 500)
     c3.write("")
     c3.write("")
-    if c3.button("Train", type="primary"):
+    if not ALLOW_TRAINING:
+        c3.caption("🔒 Training is disabled on this server (set ALLOW_TRAINING=1 locally).")
+    elif c3.button("Train", type="primary"):
         with st.spinner(f"Training {DOMAINS[to_train]['label']}... (a few minutes on CPU)"):
             train_domain(to_train, epochs=epochs, verbose=False)
             st.session_state.model_version += 1
@@ -575,6 +609,13 @@ with st.sidebar:
     st.markdown(f"<div class='brand'><div class='brand-logo'>⚛️</div><div class='brand-name'>PhysiChat</div></div>"
                 f"<div class='brand-sub'>كود الحساب: <b>{current_visitor_id}</b></div>", unsafe_allow_html=True)
     
+    with st.expander("🔑 عندك كود حساب؟ / Restore account"):
+        code_in = st.text_input("Code", key="restore_code", max_chars=12).strip().upper()
+        if st.button("استرجاع / Restore", key="restore_btn") and VID_RE.fullmatch(code_in):
+            st.session_state.visitor_id = code_in
+            st.query_params["vid"] = code_in
+            st.rerun()
+
     page = st.radio(
         "القائمة الرئيسية", 
         [
@@ -590,7 +631,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**حالة النماذج (Models)**")
     for d, cfg in DOMAINS.items():
-        st.write("🟢 " + cfg["label"])
+        st.write(("🟢 " if is_trained(d) else "🔴 ") + cfg["label"])
         
     st.divider()
     if is_pro_user:
@@ -598,7 +639,7 @@ with st.sidebar:
     else:
         # جلب العداد المحدث من قاعدة البيانات مباشرة للعرض
         current_status = get_user_status(current_visitor_id)
-        st.warning(f"📊 الرسائل اليومية: {current_status['count']}/10")
+        st.warning(f"📊 الرسائل اليومية: {current_status['count']}/{FREE_DAILY_LIMIT}")
         
     st.caption("AI Engine: Groq Llama 3 (Active)")
     if st.button("🗑 Clear chat"):
