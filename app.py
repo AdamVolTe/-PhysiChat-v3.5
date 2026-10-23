@@ -1,5 +1,6 @@
 import io
 import os
+from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
@@ -406,10 +407,6 @@ def page_chat():
                         }).execute()
                 except Exception as e:
                     print(f"Supabase error: {e}")
-                    
-                st.caption(f"📊 باقي ليك {10 - new_count} رسائل مجانية اليوم.")
-            else:
-                st.caption("👑 حساب Pro مفعل - استخدام غير محدود!")
             
             st.session_state.messages.append({"role": "user", "content": prompt, "results": []})
             with st.chat_message("user"):
@@ -428,6 +425,7 @@ def page_chat():
             n = len(st.session_state.messages) - 1
             for j, res in enumerate(results):
                 render_result(res, f"chat_{n}_{j}")
+            st.rerun()
 
 def page_playground():
     hero("Playground", "Move the sliders and watch the PINN respond instantly. Exclusive for Pro users.")
@@ -598,7 +596,9 @@ with st.sidebar:
     if is_pro_user:
         st.success("👑 حساب Pro مفعل بنجاح")
     else:
-        st.warning(f"📊 الرسائل اليومية: {msg_count}/10")
+        # جلب العداد المحدث من قاعدة البيانات مباشرة للعرض
+        current_status = get_user_status(current_visitor_id)
+        st.warning(f"📊 الرسائل اليومية: {current_status['count']}/10")
         
     st.caption("AI Engine: Groq Llama 3 (Active)")
     if st.button("🗑 Clear chat"):
