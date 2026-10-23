@@ -5,6 +5,8 @@ matplotlib
 pandas
 plotly
 streamlit
-anthropic
+groq
 sympy
 duckduckgo_search
+python-dotenv
+supabase

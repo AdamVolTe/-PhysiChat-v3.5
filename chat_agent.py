@@ -8,20 +8,24 @@ Enhanced General AI Chat agent (Groq Edition):
 import json
 import os
 import re
+import streamlit as st
 from web_search import search_web
 from math_engine import simplify_expression
 from groq import Groq
 from dotenv import load_dotenv
-import os
 
 # تحضير وتعيين المتغيرات البيئية من ملف .env
 load_dotenv()
 
-# قراءة المفتاح بأمان
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# قراءة المفتاح بأمان سواء محلياً أو على Streamlit Cloud
+
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    raise ValueError("⚠️ لم يتم العثور على GROQ_API_KEY فـ ملف .env!")
+    raise ValueError("⚠️ لم يتم العثور على GROQ_API_KEY لا في Secrets ولا في ملف .env!")
 
 client = Groq(api_key=GROQ_API_KEY)
 
