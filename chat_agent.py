@@ -19,7 +19,7 @@ from web_search import search_web
 load_dotenv()
 
 # Override with GROQ_MODEL in .env. See https://console.groq.com/docs/models for the available model IDs.
-MODEL_ID = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL_ID = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 MIN_HORIZON = 5.0
 
 SYSTEM_PROMPT = (
