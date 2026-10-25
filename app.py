@@ -1,4 +1,5 @@
 import io
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -16,25 +17,32 @@ import uuid
 from matplotlib.backends.backend_pdf import PdfPages
 
 from analysis import energy, summarize, velocity
-from chat_agent import chat_turn, get_api_key
+from chat_agent import MODEL_ID, chat_turn, get_api_key
 from physics_engine import ALPHA_MAX, DOMAINS, T_MAX, PhysicsEngineCore, reference_solution
 from physics_trainer import MODELS_DIR, train_domain
-from supabase import create_client, Client
 from dotenv import load_dotenv
+
+try:
+    from supabase import create_client
+except ImportError:          # supabase is optional: the app also runs without it
+    create_client = None
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-FREE_DAILY_LIMIT = 5                 # free messages per rolling window
+# Fair-use limit (NOT a paywall): protects the shared free LLM quota. Override in .env
+FAIR_USE_LIMIT = int(os.getenv("FAIR_USE_LIMIT", "10"))   # messages per rolling window
 FREE_WINDOW = timedelta(hours=24)    # window starts at the first message
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")           # shown on the About page (optional)
+DATA_DIR = "data"                                        # local fallback for feedback / waitlist
 # Training is heavy: only enabled when you run locally with ALLOW_TRAINING=1 in .env
 ALLOW_TRAINING = os.getenv("ALLOW_TRAINING", "0") == "1"
 
 @st.cache_resource
 def init_supabase():
     """Returns a Supabase client, or None if it is not configured / unreachable."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
         return None
     try:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -67,6 +75,16 @@ chat_border = "#cbd5e1" if is_light else "rgba(255,255,255,.06)"
 text_dir = "rtl" if is_rtl else "ltr"
 text_align = "right" if is_rtl else "left"
 
+# Theme-dependent colors for the sidebar, hero and KPI cards (readable in both modes)
+side_bg = "rgba(248,250,252,0.98)" if is_light else "rgba(10,14,22,0.97)"
+side_text = "#0f172a" if is_light else "#f1f5f9"
+line = "rgba(15,23,42,.12)" if is_light else "rgba(255,255,255,.08)"
+hero_bg = "linear-gradient(135deg,#f8fafc,#e2e8f0)" if is_light else \
+    "linear-gradient(135deg, rgba(30,41,59,.55), rgba(15,23,42,.35))"
+h1_grad = "linear-gradient(90deg,#0f172a,#0369a1 60%,#4338ca)" if is_light else \
+    "linear-gradient(90deg,#f8fafc,#7dd3fc 60%,#a5b4fc)"
+kpi_bg = "#f8fafc" if is_light else "rgba(30,41,59,.40)"
+
 COL = {"pinn": "#38bdf8", "ref": "#34d399", "amber": "#f59e0b", "violet": "#a78bfa", "red": "#f87171"}
 PALETTE = ["#38bdf8", "#a78bfa", "#f59e0b", "#34d399", "#f472b6", "#fb923c", "#22d3ee"]
 
@@ -79,19 +97,21 @@ html, body, [class*="css"], .stApp {{ font-family: 'Inter', sans-serif; }}
 header[data-testid="stHeader"] {{ background: transparent; }}
 .main .block-container {{ padding-top: 1.6rem; max-width: 1250px; direction: {text_dir}; text-align: {text_align}; }}
 
-section[data-testid="stSidebar"] {{ background: rgba(10,14,22,0.97) !important;
-    border-right: 1px solid rgba(255,255,255,0.07); color: #f1f5f9 !important; }}
+section[data-testid="stSidebar"] {{ background: {side_bg} !important;
+    border-right: 1px solid {line}; color: {side_text} !important; }}
+section[data-testid="stSidebar"] .stMarkdown, section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] h3 {{ color: {side_text} !important; }}
 .brand {{ display:flex; align-items:center; gap:10px; margin-bottom:2px; }}
 .brand-logo {{ width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center;
     background: linear-gradient(135deg,#0ea5e9,#6366f1); font-size:18px; box-shadow:0 4px 16px rgba(14,165,233,.35); }}
-.brand-name {{ font-weight:800; font-size:18px; letter-spacing:-.3px; color: #f1f5f9; }}
+.brand-name {{ font-weight:800; font-size:18px; letter-spacing:-.3px; color: {side_text}; }}
 .brand-sub {{ color:#94a3b8; font-size:12px; margin-bottom:6px; }}
 
-.hero {{ background: linear-gradient(135deg, rgba(30,41,59,.55), rgba(15,23,42,.35));
-    border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:22px 26px; margin-bottom:18px;
+.hero {{ background: {hero_bg};
+    border:1px solid {line}; border-radius:16px; padding:22px 26px; margin-bottom:18px;
     backdrop-filter: blur(10px); }}
 .hero h1 {{ margin:6px 0 4px; font-size:28px; font-weight:800; letter-spacing:-.6px;
-    background: linear-gradient(90deg,#f8fafc,#7dd3fc 60%,#a5b4fc); -webkit-background-clip:text;
+    background: {h1_grad}; -webkit-background-clip:text;
     -webkit-text-fill-color:transparent; }}
 .hero p {{ margin:0; color:#94a3b8; font-size:14px; }}
 .badge {{ display:inline-flex; align-items:center; gap:6px; font-size:11.5px; font-weight:600; padding:3px 10px;
@@ -99,11 +119,11 @@ section[data-testid="stSidebar"] {{ background: rgba(10,14,22,0.97) !important;
 .badge.warn {{ background:rgba(245,158,11,.10); border-color:rgba(245,158,11,.35); color:#fbbf24; }}
 .dot {{ width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 8px currentColor; }}
 
-.kpi {{ background: rgba(30,41,59,.40); border:1px solid rgba(255,255,255,.08); border-radius:14px;
+.kpi {{ background: {kpi_bg}; border:1px solid {line}; border-radius:14px;
     padding:14px 16px; height:100%; transition: transform .2s ease, border-color .2s ease; }}
 .kpi:hover {{ transform: translateY(-2px); border-color: rgba(56,189,248,.45); }}
 .kpi-l {{ color:#94a3b8; font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:.6px; }}
-.kpi-v {{ color:#f8fafc; font-size:22px; font-weight:700; margin-top:4px; letter-spacing:-.3px; }}
+.kpi-v {{ color:{text_color}; font-size:22px; font-weight:700; margin-top:4px; letter-spacing:-.3px; }}
 .kpi-s {{ color:#64748b; font-size:12px; margin-top:2px; }}
 
 .stButton>button, .stDownloadButton>button {{ border-radius:10px !important; font-weight:600 !important;
@@ -187,13 +207,13 @@ def error_grid(domain, version):
 # Charts (Plotly, interactive)
 # =====================================================================
 def themed(fig, title=None, height=380, xt="t (s)", yt="y(t)"):
-    grid = "rgba(148,163,184,0.12)"
+    grid = "rgba(100,116,139,0.20)" if is_light else "rgba(148,163,184,0.12)"
     fig.update_layout(
-        template="plotly_dark", height=height, margin=dict(l=8, r=8, t=52 if title else 18, b=8),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,17,23,0.55)",
+        template="plotly_white" if is_light else "plotly_dark", height=height, margin=dict(l=8, r=8, t=52 if title else 18, b=8),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(248,250,252,0.9)" if is_light else "rgba(13,17,23,0.55)",
         title=dict(text=title, font=dict(size=15)) if title else None,
         legend=dict(orientation="h", y=1.12, x=0),
-        font=dict(family="Inter, sans-serif", color="#cbd5e1"),
+        font=dict(family="Inter, sans-serif", color="#334155" if is_light else "#cbd5e1"),
         xaxis=dict(title=xt, gridcolor=grid, zeroline=False),
         yaxis=dict(title=yt, gridcolor=grid, zeroline=False), hovermode="x unified")
     return fig
@@ -342,6 +362,14 @@ def _parse_ts(value):
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
+def _local_status(now):
+    """Per-session counter. Used without a database AND as fallback if the database errors."""
+    local = st.session_state.setdefault("local_usage", {"start": None, "count": 0})
+    if local["start"] and now - local["start"] >= FREE_WINDOW:
+        local.update(start=None, count=0)
+    reset_at = local["start"] + FREE_WINDOW if (local["start"] and local["count"]) else None
+    return {"count": local["count"], "is_pro": False, "reset_at": reset_at}
+
 def fmt_remaining(reset_at):
     if not reset_at:
         return "24 ساعة"
@@ -356,12 +384,8 @@ def get_user_status(visitor_id: str):
     once 24 hours have passed (window start is stored in the last_date column).
     """
     now = _now()
-    if supabase is None:   # no database configured: per-session counter, nobody is Pro
-        local = st.session_state.setdefault("local_usage", {"start": None, "count": 0})
-        if local["start"] and now - local["start"] >= FREE_WINDOW:
-            local.update(start=None, count=0)
-        reset_at = local["start"] + FREE_WINDOW if (local["start"] and local["count"]) else None
-        return {"count": local["count"], "is_pro": False, "reset_at": reset_at}
+    if supabase is None:   # no database configured: per-session counter
+        return _local_status(now)
     try:
         res = supabase.table("visitor_limits").select("*").eq("visitor_id", visitor_id).execute()
         if res.data:
@@ -380,16 +404,16 @@ def get_user_status(visitor_id: str):
     except Exception as exc:
         print(f"Supabase error: {exc}")
         st.session_state["db_error"] = str(exc)[:300]
-        return {"count": 0, "is_pro": False, "reset_at": None}
+        return _local_status(now)   # fail closed: never unlimited because the DB is down
 
 def bump_count(visitor_id: str, new_count: int, new_window: bool):
     """new_window=True when this is the first message of a window (stores the start time)."""
     now = _now()
+    local = st.session_state.setdefault("local_usage", {"start": None, "count": 0})
+    local["count"] = new_count          # always mirrored locally: used if the database is down
+    if new_window:
+        local["start"] = now
     if supabase is None:
-        local = st.session_state.setdefault("local_usage", {"start": None, "count": 0})
-        local["count"] = new_count
-        if new_window:
-            local["start"] = now
         return
     try:
         payload = {"message_count": new_count}
@@ -419,7 +443,7 @@ def _init_visitor_id():
 _init_visitor_id()
 current_visitor_id = st.session_state.visitor_id
 user_status = get_user_status(current_visitor_id)
-is_pro_user = user_status["is_pro"]
+is_unlimited = user_status["is_pro"]   # DB flag set by hand for testers/teachers (no UI, no paywall)
 msg_count = user_status["count"]
 reset_at = user_status.get("reset_at")
 
@@ -459,16 +483,13 @@ def page_chat():
 
     if prompt:
         
-        if not is_pro_user and msg_count >= FREE_DAILY_LIMIT:
-            st.error(f"🛑 وصلتي للحد الأقصى ({FREE_DAILY_LIMIT} رسائل مجانية). تتجدد بعد {fmt_remaining(reset_at)}.")
-            st.info("💡 اشترك في باقة Pro لتستمتع برسائل ومحاكاة غير محدودة!")
-            
-            whatsapp_number = "212717817730"
-            wa_text = f"السلام عليكم، بغيت نفعل حساب PhysiChat Pro. كود الحساب ديالي هو: {current_visitor_id}"
-            wa_link = f"https://wa.me/{whatsapp_number}?text={wa_text.replace(' ', '%20')}"
-            st.markdown(f'👉 [📲 **اضغط هنا للتواصل والتفعيل عبر WhatsApp**]({wa_link})')
+        if not is_unlimited and msg_count >= FAIR_USE_LIMIT:
+            st.warning(f"⏳ وصلتي للحد اليومي ديال الاستعمال العادل ({FAIR_USE_LIMIT} رسالة). "
+                       f"كيتجدد من بعد {fmt_remaining(reset_at)}. "
+                       "هاد الحد كاين غير باش نحميو الحصة المجانية ديال الـ AI، والتطبيق مجاني.")
+            st.info("💬 عجبك المشروع؟ شاركنا رأيك فصفحة «ℹ️ About & Feedback».")
         else:
-            if not is_pro_user:
+            if not is_unlimited:
                 new_count = msg_count + 1
                 bump_count(current_visitor_id, new_count, new_window=(msg_count == 0))
             
@@ -482,7 +503,8 @@ def page_chat():
                     try:
                         text, results = chat_turn(history, run_simulation)
                     except Exception as exc:
-                        text, results = f"حدث خطأ ما: {exc}", []
+                        print(f"[chat] error: {exc}")
+                        text, results = "حدث خطأ مؤقت. عاود حاول من فضلك.", []
                     st.markdown(text)
                     
             st.session_state.messages.append({"role": "assistant", "content": text, "results": results})
@@ -492,16 +514,7 @@ def page_chat():
             st.rerun()
 
 def page_playground():
-    hero("Playground", "Move the sliders and watch the PINN respond instantly. Exclusive for Pro users.")
-    
-    if not is_pro_user:
-        st.error("🔒 ميزة المحاكاة البصرية والمنحنيات حصرية لمشتركي PhysiChat Pro!")
-        st.info("💡 اشترك الآن لتفتح جميع الأدوات والمحاكاة التفاعلية بدون حدود.")
-        whatsapp_number = "212717817730"
-        wa_text = f"السلام عليكم، بغيت نفعل حساب PhysiChat Pro باش نفتح المحاكاة. كود الحساب ديالي هو: {current_visitor_id}"
-        wa_link = f"https://wa.me/{whatsapp_number}?text={wa_text.replace(' ', '%20')}"
-        st.markdown(f'👉 [🚀 **تواصل معنا عبر WhatsApp لتفعيل Pro**]({wa_link})')
-        return
+    hero("Playground", "Move the sliders and watch the PINN respond instantly.")
 
     c1, c2, c3 = st.columns([2, 2, 2])
     domain = c1.selectbox("System", list(DOMAINS), format_func=lambda d: DOMAINS[d]["label"])
@@ -513,15 +526,7 @@ def page_playground():
         st.warning(str(exc))
 
 def page_compare():
-    hero("Compare", "Overlay several damping values on one chart. Exclusive for Pro users.")
-    
-    if not is_pro_user:
-        st.error("🔒 ميزة المقارنة والمحاكاة حصرية لمشتركي PhysiChat Pro!")
-        whatsapp_number = "212717817730"
-        wa_text = f"السلام عليكم، بغيت نفعل حساب PhysiChat Pro. كود الحساب ديالي هو: {current_visitor_id}"
-        wa_link = f"https://wa.me/{whatsapp_number}?text={wa_text.replace(' ', '%20')}"
-        st.markdown(f'👉 [🚀 **تواصل معنا عبر WhatsApp لتفعيل Pro**]({wa_link})')
-        return
+    hero("Compare", "Overlay several damping values on one chart.")
 
     c1, c2, c3 = st.columns([2, 3, 2])
     domain = c1.selectbox("System", list(DOMAINS), format_func=lambda d: DOMAINS[d]["label"], key="cmp_dom")
@@ -590,94 +595,120 @@ def page_lab():
     if lf is not None:
         st.plotly_chart(lf, key="lab_loss")
 
-def page_pricing():
-    st.header("👑 باقات PhysiChat Pro")
-    st.write("استمتع بذكاء اصطناعي غير محدود، محاكاة بصرية، ورسوم بيانية دقيقة لحل المسائل العلمية!")
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
-    col1, col2, col3, col4 = st.columns(4)
+def _save_record(table, record):
+    """Saves feedback / waitlist entries in Supabase, or in a local JSONL file as a fallback."""
+    record = {**record, "created_at": _now().isoformat()}
+    if supabase is not None:
+        try:
+            supabase.table(table).insert(record).execute()
+            return True
+        except Exception as exc:
+            print(f"Supabase error ({table}): {exc}")
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(os.path.join(DATA_DIR, f"{table}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError as exc:
+        print(f"Local save error ({table}): {exc}")
+        return False
 
-    with col1:
-        st.subheader("🆓 المجانية")
-        st.write(f"• {FREE_DAILY_LIMIT} رسائل مجانية كل 24 ساعة")
-        st.write("• إجابات ذكية وسريعة")
-        st.write("• تتجدد بعد 24 ساعة من أول رسالة")
-        st.button("الحالية", disabled=True, key="free_btn")
+def _too_many_submits(key, limit=3):
+    n = st.session_state.get(key, 0)
+    st.session_state[key] = n + 1
+    return n >= limit
 
-    with col2:
-        st.subheader("🥉 شهري")
-        st.markdown("**49 درهم / شهر**")
-        st.write("• رسائل غير محدودة ♾️")
-        st.write("• محاكاة بصرية كاملة")
-        st.button("اختر الشهري", key="m_btn")
+def page_about():
+    hero("About & Feedback", "PhysiChat فمرحلة Beta مجانية. رأيك كيعاوننا نطورو المشروع.")
+    st.markdown(
+        "**PhysiChat** مشروع تعليمي كيستعمل Physics-Informed Neural Networks (PINNs) باش يحاكي أنظمة فيزيائية "
+        "ويشرحها بالدارجة، العربية، الفرنسية والإنجليزية. كل نتيجة كتتقارن مع حل عددي (SciPy) باش تشوف الدقة الحقيقية. "
+        "طوّرو Adam (مطور مغربي)."
+        + (f"\n\n📧 للتواصل: {CONTACT_EMAIL}" if CONTACT_EMAIL else ""))
+    tab_fb, tab_wait, tab_priv = st.tabs(["💬 Feedback", "🔔 ميزات جاية", "🔒 Privacy / الخصوصية"])
 
-    with col3:
-        st.subheader("🥈 6 أشهر")
-        st.markdown("**125 درهم / 6 أشهر**")
-        st.write("• توفير مهم للفصل الدراسي")
-        st.write("• محاكاة بصرية كاملة")
-        st.button("اختر 6 أشهر", key="s_btn")
+    with tab_fb:
+        with st.form("fb_form", clear_on_submit=True):
+            rating = st.select_slider("شحال عجبك التطبيق؟", options=[1, 2, 3, 4, 5], value=4)
+            text = st.text_area("شنو عجبك؟ شنو خاصنا نحسنو؟ شي bug؟", max_chars=1000)
+            if st.form_submit_button("إرسال"):
+                if not text.strip():
+                    st.warning("كتب شي حاجة قبل الإرسال.")
+                elif _too_many_submits("fb_count"):
+                    st.info("شكراً! وصلنا بزاف د الرسائل منك فهاد الجلسة.")
+                elif _save_record("feedback", {"visitor_id": current_visitor_id,
+                                               "rating": int(rating), "message": text.strip()[:1000]}):
+                    st.success("شكراً بزاف! وصلنا رأيك 🙏")
+                else:
+                    st.error("وقع مشكل فالحفظ، عاود حاول من بعد.")
 
-    with col4:
-        st.subheader("👑 سنوي")
-        st.markdown("**200 درهم / سنة**")
-        st.write("• توفير كبير جداً ⭐")
-        st.write("• دعم ومميزات حصرية")
-        st.button("اختر السنوي", key="y_btn")
+    with tab_wait:
+        st.write("دابا كلشي مجاني. إلا بغيتي نخبروك ملي نطلقو ميزات جداد (مثلا حل مسائل الباك خطوة بخطوة)، "
+                 "خلي الإيميل ديالك. **اختياري** وما غنصيفطو ليك غير أخبار المشروع.")
+        with st.form("wait_form", clear_on_submit=True):
+            email = st.text_input("Email", max_chars=120)
+            if st.form_submit_button("خبروني"):
+                email = email.strip()
+                if not EMAIL_RE.fullmatch(email):
+                    st.warning("الإيميل ماشي صحيح.")
+                elif _too_many_submits("wait_count"):
+                    st.info("تسجلتي من قبل 👍")
+                elif _save_record("waitlist", {"visitor_id": current_visitor_id, "email": email.lower()}):
+                    st.success("تسجلتي، شكراً! ✅")
+                else:
+                    st.error("وقع مشكل فالحفظ، عاود حاول من بعد.")
 
-    st.markdown("---")
-    st.markdown("📲 **طريقة التفعيل الفوري عبر WhatsApp:**")
-    st.info(f"كود الحساب الخاص بك هو: **{current_visitor_id}** (قم بنسخه وإرساله عبر الواتساب لتفعيل باقتك فوراً)")
-    
-    whatsapp_number = "212717817730" 
-    wa_text = f"السلام عليكم، بغيت نفعل باقة Pro. كود الحساب ديالي هو: {current_visitor_id}"
-    wa_link = f"https://wa.me/{whatsapp_number}?text={wa_text.replace(' ', '%20')}"
-    
-    st.markdown(f'👉 [📲 **اضغط هنا للتواصل والتفعيل عبر WhatsApp**]({wa_link})')
+    with tab_priv:
+        st.markdown(
+            "**شنو كنجمعو:**\n"
+            "- كود عشوائي (`vid`) كيبان فالرابط، وعداد الرسائل ووقت أول رسالة، باش نطبقو حد الاستعمال العادل.\n"
+            "- الإيميل والـ feedback، **غير إلا بعثتيهم بوحدك** فصفحة About.\n\n"
+            "**شنو ما كنخزنوش:** المحادثات ما كتتخزنش فقاعدة البيانات ديالنا، كتبقى غير فالجلسة ديالك.\n\n"
+            "**الخدمات الخارجية:** الرسائل ديالك كتصيفط لـ Groq باش يجاوب الـ AI، وكلمات البحث لـ DuckDuckGo "
+            "ملي تطلب معلومات حية. هاد الجهات عندها سياساتها. ما تكتبش معلومات شخصية أو حساسة فالشات.\n\n"
+            "**الحذف:** باش تمسح الإيميل أو الـ feedback ديالك، تواصل معانا"
+            + (f" على {CONTACT_EMAIL}." if CONTACT_EMAIL else ".") + "\n\n"
+            "ما كنبيعو حتى بيانات ولا كنشاركوها لأغراض إشهارية.")
 
 # =====================================================================
 # Sidebar & Navigation
 # =====================================================================
 with st.sidebar:
-    st.markdown(f"<div class='brand'><div class='brand-logo'>⚛️</div><div class='brand-name'>PhysiChat</div></div>"
-                f"<div class='brand-sub'>كود الحساب: <b>{current_visitor_id}</b></div>", unsafe_allow_html=True)
-    
-    with st.expander("🔑 عندك كود حساب؟ / Restore account"):
-        code_in = st.text_input("Code", key="restore_code", max_chars=12).strip().upper()
-        if st.button("استرجاع / Restore", key="restore_btn") and VID_RE.fullmatch(code_in):
-            st.session_state.visitor_id = code_in
-            st.query_params["vid"] = code_in
-            st.rerun()
+    st.markdown("<div class='brand'><div class='brand-logo'>⚛️</div><div class='brand-name'>PhysiChat</div></div>"
+                "<div class='brand-sub'>Free Beta · مجاني بالكامل</div>", unsafe_allow_html=True)
 
     page = st.radio(
-        "القائمة الرئيسية", 
+        "القائمة الرئيسية",
         [
-            "💬 Copilot Chat", 
-            "⚅ Playground", 
-            "⚖️ Compare", 
-            "🧪 Model Lab", 
-            "👑 باقات PhysiChat Pro"
+            "💬 Copilot Chat",
+            "⚅ Playground",
+            "⚖️ Compare",
+            "🧪 Model Lab",
+            "ℹ️ About & Feedback",
         ],
         label_visibility="collapsed"
     )
-    
+
     st.divider()
     st.markdown("**حالة النماذج (Models)**")
     for d, cfg in DOMAINS.items():
         st.write(("🟢 " if is_trained(d) else "🔴 ") + cfg["label"])
-        
+
     st.divider()
-    if is_pro_user:
-        st.success("👑 حساب Pro مفعل بنجاح")
+    if is_unlimited:
+        st.success("🧪 حساب Tester (بلا حد)")
     else:
-        # جلب العداد المحدث من قاعدة البيانات مباشرة للعرض
         current_status = get_user_status(current_visitor_id)
-        st.warning(f"📊 الرسائل اليومية: {current_status['count']}/{FREE_DAILY_LIMIT}")
+        st.info(f"📊 الاستعمال اليوم: {current_status['count']}/{FAIR_USE_LIMIT}")
+    if ALLOW_TRAINING:   # diagnostics only for the developer running locally
         if supabase is None:
             st.caption("⚠️ Supabase غير متصل: تأكد من SUPABASE_URL و SUPABASE_KEY فـ .env")
         elif st.session_state.get("db_error"):
             st.caption(f"⚠️ Supabase error: {st.session_state['db_error']}")
-        
-    st.caption("AI Engine: Groq Llama 3 (Active)")
+
+    st.caption(f"AI Engine: Groq · {MODEL_ID}" if get_api_key() else "AI Engine: offline mode (no GROQ_API_KEY)")
     if st.button("🗑 Clear chat"):
         st.session_state.messages = []
         st.rerun()
@@ -690,7 +721,7 @@ pages = {
     "⚅ Playground": page_playground,
     "⚖️ Compare": page_compare,
     "🧪 Model Lab": page_lab,
-    "👑 باقات PhysiChat Pro": page_pricing
+    "ℹ️ About & Feedback": page_about,
 }
 
 pages[page]()

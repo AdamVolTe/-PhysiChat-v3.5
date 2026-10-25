@@ -8,6 +8,7 @@ PhysiChat agent (Groq):
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -19,8 +20,14 @@ from web_search import search_web
 load_dotenv()
 
 # Override with GROQ_MODEL in .env. See https://console.groq.com/docs/models for the available model IDs.
-MODEL_ID = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+MODEL_ID = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MIN_HORIZON = 5.0
+# If the main model is rate-limited (429) or unavailable, try this one (Groq limits are per model,
+# so a fallback roughly doubles the free quota). Set GROQ_FALLBACK_MODEL="" to disable.
+FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
+MAX_HISTORY = 6       # only the last N messages are sent to the LLM (saves free-tier quota)
+MAX_TOKENS = 1024     # max answer length (reasoning models also spend tokens thinking)
+MAX_RETRIES = 1       # retries per model on 429 / 5xx before switching to the fallback
 
 SYSTEM_PROMPT = (
     "You are PhysiChat AI, a powerful, versatile and friendly general AI assistant created by Adam. "
@@ -170,6 +177,49 @@ def _offline_reply(text, run_simulation_fn):
     return msg, [res]
 
 
+# ---------------------------------------------------------------- error handling
+def _error_status(exc):
+    return getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _friendly_error(exc):
+    """Short, user-facing message (no raw stack/API details)."""
+    status = _error_status(exc)
+    if status == 429:
+        return "⏳ الخدمة مشغولة دابا (بزاف د الطلبات). عاود جرب من بعد دقيقة."
+    if status in (401, 403):
+        return "⚠️ مشكل فمفتاح الـ API. صاحب التطبيق خاصو يتأكد من GROQ_API_KEY."
+    if status == 404 or "model" in str(exc).lower():
+        return f"⚠️ المودل '{MODEL_ID}' ما كاينش أو ما متاحش. تأكد من GROQ_MODEL."
+    print(f"[chat_agent] error: {exc}")
+    return "عذراً، وقع خطأ مؤقت. عاود حاول من فضلك."
+
+
+def _create_with_retry(client, kwargs):
+    """Calls Groq: short retry on 429/5xx, then switches to FALLBACK_MODEL (429, 404 or 5xx only)."""
+    models = [kwargs["model"]]
+    if FALLBACK_MODEL and FALLBACK_MODEL != kwargs["model"]:
+        models.append(FALLBACK_MODEL)
+    last_exc = None
+    for model in models:
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                return client.chat.completions.create(**{**kwargs, "model": model})
+            except Exception as exc:
+                last_exc = exc
+                status = _error_status(exc)
+                overloaded = status == 429 or (status is not None and status >= 500)
+                if overloaded and attempt < MAX_RETRIES:
+                    time.sleep(1.5)
+                    continue
+                if not (overloaded or status == 404):
+                    raise            # e.g. 401 bad key / 400 bad request: a fallback would not help
+                print(f"[chat_agent] {model} failed ({status}); trying next model" if model != models[-1]
+                      else f"[chat_agent] {model} failed ({status})")
+                break
+    raise last_exc
+
+
 # ---------------------------------------------------------------- main entry point
 def chat_turn(history, run_simulation_fn, max_tool_rounds=3):
     """history: [{"role","content"}, ...]. Returns (assistant_text, [simulation results])."""
@@ -178,14 +228,14 @@ def chat_turn(history, run_simulation_fn, max_tool_rounds=3):
         return _offline_reply(history[-1]["content"], run_simulation_fn)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [
-        {"role": m["role"], "content": m["content"]} for m in history]
+        {"role": m["role"], "content": m["content"]} for m in history[-MAX_HISTORY:]]
     results = []
     try:
         for round_no in range(max_tool_rounds + 1):
-            kwargs = dict(model=MODEL_ID, messages=messages, temperature=0.7, max_tokens=2048)
+            kwargs = dict(model=MODEL_ID, messages=messages, temperature=0.7, max_tokens=MAX_TOKENS)
             if round_no < max_tool_rounds:            # last round: force a final text answer
                 kwargs.update(tools=TOOLS, tool_choice="auto")
-            msg = client.chat.completions.create(**kwargs).choices[0].message
+            msg = _create_with_retry(client, kwargs).choices[0].message
             if not msg.tool_calls:
                 return msg.content or "", results
 
@@ -202,4 +252,4 @@ def chat_turn(history, run_simulation_fn, max_tool_rounds=3):
                                  "content": _run_tool(tc.function.name, args, run_simulation_fn, results)})
         return "", results
     except Exception as e:
-        return f"عذراً، وقع خطأ أثناء معالجة الطلب: {e}", results
+        return _friendly_error(e), results
