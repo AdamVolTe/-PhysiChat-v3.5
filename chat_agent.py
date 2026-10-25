@@ -20,7 +20,7 @@ from web_search import search_web
 load_dotenv()
 
 # Override with GROQ_MODEL in .env. See https://console.groq.com/docs/models for the available model IDs.
-MODEL_ID = os.getenv("GROQ_MODEL", "qwenqwen3.8-27b")
+MODEL_ID = os.getenv("GROQ_MODEL", "GROQ_MODEL=llama-3.1-8b-instant")
 MIN_HORIZON = 5.0
 # If the main model is rate-limited (429) or unavailable, try this one (Groq limits are per model,
 # so a fallback roughly doubles the free quota). Set GROQ_FALLBACK_MODEL="" to disable.
